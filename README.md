@@ -45,6 +45,17 @@ cat notes.txt | geg '旅行计划'
 
 ### 1 · 安装命令
 
+**预编译单文件**：从 [GitHub Releases](https://github.com/LIghtJUNction/geg/releases/latest) 下载对应平台的压缩包与 `.sha256` 校验文件，校验后解压即可，无需安装 Rust、CMake 或 Python。目前提供 **Linux x86_64、macOS Apple Silicon、Windows x86_64**。模型权重需要另外准备；Linux 依赖 glibc / libstdc++，Windows 可能需要 Microsoft Visual C++ 运行库。
+
+```sh
+# Linux：在下载目录校验、解压并安装
+sha256sum -c geg-v0.1.0-x86_64-unknown-linux-gnu.tar.gz.sha256
+tar -xzf geg-v0.1.0-x86_64-unknown-linux-gnu.tar.gz
+install -Dm755 geg "$HOME/.local/bin/geg"  # 确保 ~/.local/bin 在 PATH 中
+```
+
+**或者从 crates.io 编译安装**：
+
 ```sh
 cargo install geg --locked
 ```
@@ -261,7 +272,7 @@ geg skill | Set-Content -Encoding utf8 "$HOME\.agents\skills\geg\SKILL.md"
 python3 scripts/benchmark.py --binary target/release/geg --model "$GEG_MODEL"
 ```
 
-目前完成实机验证的是 **Linux x86_64**。macOS / Windows 使用相应平台的源码构建，尚未在本项目中完成实机验证；此处不承诺相同速度与内存数据。
+真实模型实机验证的范围是 **Linux x86_64**。三个分发目标均已通过正式构建及 `--version` / `skill` 启动检查；macOS / Windows 尚未完成真实 GGUF 推理验证，不承诺相同速度与内存数据。
 
 ## 本地开发与验证
 

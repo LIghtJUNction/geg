@@ -200,7 +200,13 @@ fn explicit_index_is_incremental_atomic_and_independent_of_sources() {
     fs::remove_file(f.dir.path().join("a.txt")).unwrap();
     assert_eq!(
         stdout(&f.run(&["query", "login", "--index", "index.db", "-nH"])),
-        format!("{}:1:security\n", f.dir.path().join("a.txt").display())
+        format!(
+            "{}:1:security\n",
+            fs::canonicalize(f.dir.path())
+                .unwrap()
+                .join("a.txt")
+                .display()
+        )
     );
     assert_eq!(
         f.run(&["query", "login", "--index", "index.db", "-i"])

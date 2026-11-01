@@ -15,6 +15,8 @@
 
 </div>
 
+![终端示例：在 geg 源码中查找 GPU 不可用错误](docs/search-example.svg)
+
 ---
 
 ```sh
@@ -317,9 +319,10 @@ printf 'authentication\nretry logic\n' | geg --interactive --code src/
 命令内嵌完整的 [`skills/geg/SKILL.md`](skills/geg/SKILL.md)。**全局安装**（Pi 也识别这个目录）：
 
 ```sh
-mkdir -p ~/.agents/skills/geg
-geg skill > ~/.agents/skills/geg/SKILL.md
+mkdir -p ~/.agents/skills/geg && geg skill > ~/.agents/skills/geg/SKILL.md
 ```
+
+先完成上方的 geg 命令行安装；这条命令导出当前已安装版本的技能，不下载模型。重新打开或刷新 agent 后生效。
 
 其他备选位置，不用全部安装：
 
@@ -360,6 +363,32 @@ geg skill | Set-Content -Encoding utf8 "$HOME\.agents\skills\geg\SKILL.md"
 Rust 包装层使用 `llama-cpp-4 0.9`，原生引擎和 SQLite 链入可执行文件。GPU 推理采用有界多序列 batch（最多 8 序列/1024 tokens，每序列最多 512 tokens），互不混合注意力。mmap 不代表零 RAM；模型页、词表和计算图仍有占用，GPU 显存另计。模型和原生依赖遵循各自许可证；不能把 Linux 二进制直接搬到 macOS / Windows。
 
 ## 实测与复现
+
+### 用 geg 搜索 geg 自己
+
+2026-11-01 在公开提交 [`c4b21ff`](https://github.com/LIghtJUNction/geg/tree/c4b21ffd667b5976d80cfad8739246e41dcecf67) 的 `src/` 快照上测试；使用已安装的 0.1.1 开发版二进制、RTX 4060 Laptop GPU、Q4 模型、默认 32 个候选。每次搜索扫描 12 个文件、435 个有效块，无跳过文件。
+
+| 查询 | 首次空向量缓存 | 重复 3 次中位数 | 首条结果与人工核对 |
+| --- | ---: | ---: | --- |
+| `GPU unavailable error` | 3.36 秒 | 0.10 秒 | [`src/embedding.rs:49`](https://github.com/LIghtJUNction/geg/blob/c4b21ffd667b5976d80cfad8739246e41dcecf67/src/embedding.rs#L49)：直接命中 GPU 不可用的检查及错误消息，准确。 |
+| `select lexical candidates before semantic reranking` | 4.19 秒 | 0.09 秒 | [`src/candidates.rs:33`](https://github.com/LIghtJUNction/geg/blob/c4b21ffd667b5976d80cfad8739246e41dcecf67/src/candidates.rs#L33)：命中候选的词法分数排序，但没有展示完整筛选流程，只算部分相关。 |
+
+这是两个查询的人工检查，不是总体准确率。每次首次运行使用独立空向量数据库，均计算 33 个向量；重复运行全部命中缓存。计时包含进程启动和扫描，但没有清空系统文件页缓存或 GPU 驱动缓存。速度因机器和缓存状态而异。
+
+复现（先按上文安装开发版并准备模型；`--device cpu` 可在无 GPU 时替换 `gpu`）：
+
+```sh
+git clone https://github.com/LIghtJUNction/geg.git
+cd geg
+git checkout c4b21ffd667b5976d80cfad8739246e41dcecf67
+export GEG_MODEL="$HOME/.cache/geg/models/embeddinggemma-2-UD-Q4_K_XL.gguf"
+python3 scripts/benchmark.py --binary "$(command -v geg)" --model "$GEG_MODEL" \
+  --device gpu --repository src --query 'GPU unavailable error'
+python3 scripts/benchmark.py --binary "$(command -v geg)" --model "$GEG_MODEL" \
+  --device gpu --repository src --query 'select lexical candidates before semantic reranking'
+```
+
+脚本输出 `cold_search.seconds`、`warm_search_median_s` 和 `first` 命中；打开对应源码人工核对。为固定二进制版本，可先运行 `cargo install --git https://github.com/LIghtJUNction/geg.git --rev c4b21ffd667b5976d80cfad8739246e41dcecf67 --locked`。不要在有未提交工作的已有检出中直接执行示例的 checkout。
 
 ### AstrBot 实测（2026-11-01）
 

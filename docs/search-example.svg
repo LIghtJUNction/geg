@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="300" viewBox="0 0 1200 300" role="img" aria-labelledby="title desc">
+<title id="title">geg semantic search example</title><desc id="desc">A terminal-style illustration of a real search for GPU unavailable error in the geg source.</desc>
+<rect width="1200" height="300" rx="12" fill="#171c1a"/>
+<text x="48" y="57" fill="#8d9c92" font-family="monospace" font-size="18">geg / local semantic search</text>
+<path d="M48 78H1152" stroke="#34413a"/>
+<text x="48" y="126" fill="#e1e7df" font-family="monospace" font-size="21"><tspan fill="#a6c89d">$</tspan> geg --code 'GPU unavailable error' src/</text>
+<text x="48" y="181" fill="#a6c89d" font-family="monospace" font-size="20">src/embedding.rs:49</text>
+<text x="48" y="222" fill="#d4ddd3" font-family="monospace" font-size="18">--device gpu requested but no compatible GPU backend/device is available</text>
+<text x="48" y="268" fill="#8d9c92" font-family="monospace" font-size="16">Example from commit c4b21ff · result excerpt · see benchmark below</text>
+</svg>

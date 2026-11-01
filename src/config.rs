@@ -25,6 +25,8 @@ struct Config {
     code: Option<bool>,
     jsonl: Option<bool>,
     format: Option<String>,
+    pretty: Option<bool>,
+    color: Option<String>,
     no_progress: Option<bool>,
     device: Option<String>,
     exhaustive: Option<bool>,
@@ -152,7 +154,8 @@ fn apply_file(args: &mut Args, matches: &ArgMatches, path: &Path) -> Result<()> 
         no_progress,
         cache_warning_gb,
         exhaustive,
-        candidates
+        candidates,
+        pretty
     );
     ensure!(
         config.candidates.is_none_or(|v| (1..=512).contains(&v)),
@@ -174,11 +177,20 @@ fn apply_file(args: &mut Args, matches: &ArgMatches, path: &Path) -> Result<()> 
     }
     if let Some(value) = config.format {
         ensure!(
-            ["md", "grep"].contains(&value.as_str()),
-            "format must be md or grep"
+            ["md", "pretty", "grep"].contains(&value.as_str()),
+            "format must be md, pretty or grep"
         );
         if !explicit("format") {
             args.format = value;
+        }
+    }
+    if let Some(value) = config.color {
+        ensure!(
+            ["auto", "always", "never"].contains(&value.as_str()),
+            "color must be auto, always or never"
+        );
+        if !explicit("color") {
+            args.color = value;
         }
     }
     if !explicit("threads")

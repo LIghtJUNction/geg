@@ -138,8 +138,7 @@ pub struct Args {
     /// Flush output after every selected line
     #[arg(long, global = true)]
     pub line_buffered: bool,
-    /// Semantic query (optional in --interactive/--tui mode)
-    #[arg(required_unless_present_any = ["interactive", "tui", "patterns", "pattern_files"])]
+    /// Semantic query; omit to open the interactive finder in the current directory
     pub query: Option<String>,
     /// Files/directories; '-' or no paths reads stdin
     pub paths: Vec<PathBuf>,
@@ -158,14 +157,20 @@ pub struct Args {
     /// Keep model/context resident; read one query per stdin line, emit JSON responses
     #[arg(long)]
     pub interactive: bool,
-    /// fzf-style live fuzzy finder with debounced semantic reranking and Tab preview
-    #[arg(long, conflicts_with_all = ["interactive", "patterns", "pattern_files", "quiet", "count", "files_with_matches", "files_without_match"])]
+    /// Internal mode selected when no search query is supplied.
+    #[arg(skip)]
     pub tui: bool,
     /// Emit one JSON object per match instead of Markdown (interactive mode always uses JSON)
     #[arg(long = "jsonl", global = true)]
     pub json: bool,
-    /// Ranked result format (Markdown by default; grep for line-oriented output)
-    #[arg(long, global = true, default_value = "md", value_parser = ["md", "grep"])]
+    /// Human-friendly result cards with line numbers and optional terminal colors
+    #[arg(long, global = true)]
+    pub pretty: bool,
+    /// Color policy for pretty output (auto respects NO_COLOR and redirects)
+    #[arg(long, global = true, default_value = "auto", value_parser = ["auto", "always", "never"])]
+    pub color: String,
+    /// Ranked result format (Markdown by default; pretty for humans, grep for scripts)
+    #[arg(long, global = true, default_value = "md", value_parser = ["md", "pretty", "grep"])]
     pub format: String,
     /// Disable stderr progress/status without hiding results
     #[arg(long, global = true)]

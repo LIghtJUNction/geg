@@ -29,7 +29,7 @@ geg --format grep -nH --score --chunk-lines 1 'password verification' src/auth.r
 
 Default output is one Markdown table with a single header: `path`, `line` (1-based), `score`, `text`. Newlines use `<br>`; Markdown/HTML special characters are escaped. Use **`--jsonl`**, not the removed `--json`, when parsing results programmatically: one JSON object per selected chunk with the same fields. Status, progress and suggestions go to stderr, never stdout.
 
-Default search scans text, selects at most **32 lexical/fuzzy candidates**, then semantically reranks only those chunks. This avoids embedding the entire repository on first use but **can miss synonyms and relevant implementations outside the shortlist**. Chinese terms/bigrams and ASCII keywords help selection; fuzzy path matching rewards word boundaries, camelCase and consecutive characters.
+Default search scans text, selects at most **32 lexical/fuzzy candidates**, then semantically reranks only those chunks. This avoids embedding the entire repository on first use but **can miss synonyms and relevant implementations outside the shortlist**. Chinese terms/bigrams, a bounded bilingual coding glossary, and ASCII keywords help selection; fuzzy path matching rewards word boundaries, camelCase and consecutive characters. Fast `--code` directory scans skip non-source/lock/minified files and import-only chunks, limit single-file dominance, and combine semantic/lexical/declaration signals for ranking. Explicit file inputs and exhaustive/indexed search remain broader. `score` is still raw cosine similarity, not probability or necessarily the fast-code sort key; unknown languages and paraphrases can still be missed.
 
 ```sh
 geg --candidates 128 --code 'retry logic' .  # larger shortlist, more inference
@@ -73,11 +73,14 @@ Each stdin line yields one flushed JSON response containing `query`, `hits`, `co
 For a person in an actual terminal:
 
 ```sh
-geg --tui src/
-geg --tui --code 'retry a failed request' src/
+cd /path/to/repository
+geg                   # no query + interactive stdin/stderr TTY opens the finder
+geg --code            # code retrieval after the user types a query
 ```
 
-`--tui` is a built-in fzf-style picker, not an external fzf invocation: bottom prompt, live background fuzzy file filtering, 200 ms semantic debounce, latest-query-wins work, retained inference model, Unicode editing, ↑/↓ or Ctrl-P/N, Tab preview, Enter select, Esc/Ctrl-C exit. File browsing itself does not need weights; semantic search does. Enter emits the selected result only after restoring the terminal. A fuzzy-only file selection has score 0, not a computed semantic score. Do not invoke TUI from a headless tool or pipe; use the JSON protocol instead. The filename inventory is capped at 100,000 entries; narrow the paths for bigger trees.
+Bare `geg` is a built-in fzf-style picker when stdin/stderr are interactive TTYs; there is no `tui` subcommand or `--tui` option. Without a TTY, bare `geg` only prints concise grep-style usage and `--help` guidance, loads no model, and exits 0. The finder is not an external fzf invocation: bottom prompt, live background fuzzy file filtering, 200 ms semantic debounce, latest-query-wins work, retained inference model, Unicode editing, ↑/↓ or Ctrl-P/N, Tab preview, Enter select, Esc/Ctrl-C exit. File browsing itself does not need weights; semantic search does. Enter emits the selected result only after restoring the terminal. A fuzzy-only file selection has score 0, not a computed semantic score. Do not invoke TUI from a headless tool or pipe; use the JSON protocol instead. The filename inventory is capped at 100,000 entries; change into a smaller directory for bigger trees. Human-readable search cards: `geg --pretty --code 'main function' src/`; `--color auto|always|never` controls ANSI output. Redirects and NO_COLOR disable automatic color. Explicit `--jsonl` overrides pretty output.
+
+When developing geg itself, use geg to locate implementations with a fresh question at meaningful steps, then inspect source to verify the answer. Do not count a matching filename, quoted test fixture, README example or high cosine score as proof of correctness. The repository's `scripts/test_relevance.py` runs local-model self-retrieval checks against actual function/body anchors; this small regression set is not a general quality benchmark.
 
 ## Directory rules and configuration
 

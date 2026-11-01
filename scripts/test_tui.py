@@ -29,7 +29,7 @@ def scenario(binary, root, select_result):
         os.environ['HOME'] = str(root)
         os.environ['XDG_CACHE_HOME'] = str(root / 'cache')
         os.execv(binary, [binary, '--no-config', '--model', str(root / 'missing.gguf'),
-                          '--tui', 'src/'])
+                          '--no-progress'])
     os.close(output_w)
     fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack('HHHH', 24, 100, 0, 0))
     os.kill(pid, signal.SIGWINCH)
@@ -97,9 +97,10 @@ def real_model_scenario(binary, model, repository):
             os.close(read_fd)
             os.dup2(write_fd, 1)
             os.close(write_fd)
+            os.chdir(repository)
             os.execv(binary, [binary, '--no-config', '--model', model,
                 '--cache', temporary + '/vectors.db', '--device', 'gpu',
-                '--tui', '--code', '--jsonl', '失败请求的重试逻辑', repository])
+                '--code', '--jsonl'])
         os.close(write_fd)
         fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack('HHHH', 30, 150, 0, 0))
         screen, output = bytearray(), bytearray()
@@ -122,6 +123,12 @@ def real_model_scenario(binary, model, repository):
             raise AssertionError('semantic timeout: ' + screen[-1000:].decode(errors='replace'))
 
         try:
+            deadline = time.monotonic() + 10
+            while b'fuzzy file picker' not in screen and time.monotonic() < deadline:
+                if select.select([master], [], [], 0.05)[0]:
+                    screen.extend(os.read(master, 65536))
+            assert b'fuzzy file picker' in screen, screen[-1000:]
+            os.write(master, '失败请求的重试逻辑'.encode())
             first = wait_for_result()
             os.write(master, b'\x15' + '鉴权失败后的处理'.encode())
             second = wait_for_result()
@@ -143,7 +150,7 @@ def real_model_scenario(binary, model, repository):
             assert status == 0, ('GPU TUI exit status', status)
             import json
             hit = json.loads(output)
-            assert hit['score'] > 0 and Path(hit['path']).is_file(), hit
+            assert hit['score'] > 0 and (Path(repository) / hit['path']).is_file(), hit
             lflag = termios.tcgetattr(master)[3]
             assert lflag & termios.ICANON and lflag & termios.ECHO
             print(json.dumps({'gpu_tui_first_s': first, 'gpu_tui_second_s': second,
@@ -172,8 +179,15 @@ def main():
         (root / 'src' / 'auth.rs').write_text('fn authenticate() {}\n')
         (root / '.gitignore').write_text('src/ignored.rs\n')
         (root / 'src' / 'ignored.rs').write_text('ignored\n')
-        scenario(binary, root, False)
-        scenario(binary, root, True)
+        blocked = root / 'src' / 'restricted'
+        blocked.mkdir()
+        (blocked / 'secret.rs').write_text('must not be scanned\n')
+        blocked.chmod(0)
+        try:
+            scenario(binary, root, False)
+            scenario(binary, root, True)
+        finally:
+            blocked.chmod(0o700)
     print('PASS: PTY Escape/selection, Unicode edits, fuzzy filtering, Tab preview, clean stdout, terminal restoration')
     if args.model:
         real_model_scenario(binary, str(args.model.resolve(strict=True)), str(args.repository.resolve(strict=True)))

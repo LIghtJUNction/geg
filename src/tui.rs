@@ -129,7 +129,7 @@ enum Message {
 pub fn run(args: &Args, model: PathBuf, cache_path: PathBuf) -> Result<Option<Hit>> {
     ensure!(
         io::stdin().is_terminal() && io::stderr().is_terminal(),
-        "--tui needs an interactive terminal; use --interactive for stdin JSON queries"
+        "the finder needs an interactive terminal; use --interactive for stdin JSON queries"
     );
     ensure!(
         args.paths

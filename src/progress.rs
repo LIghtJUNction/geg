@@ -51,6 +51,13 @@ impl Progress {
         }
         self.last_report = Instant::now();
     }
+    pub fn message(&self, message: impl AsRef<str>) {
+        if let Some(bar) = &self.bar {
+            bar.println(message.as_ref());
+        } else {
+            eprintln!("{}", message.as_ref());
+        }
+    }
     pub fn device(&self, device: &str) {
         let message = format!("using {device} inference");
         if let Some(bar) = &self.bar {

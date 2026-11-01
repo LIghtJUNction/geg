@@ -105,13 +105,35 @@ fn help_version_and_unsupported_flags() {
 }
 
 #[test]
-fn tui_rejects_headless_input_without_polluting_stdout() {
+fn headless_startup_prints_grep_help_without_a_model() {
     let f = Fixture::new();
-    let out = f.run(&["--tui"]);
-    assert_eq!(out.status.code(), Some(2));
-    assert!(out.stdout.is_empty());
-    assert!(String::from_utf8_lossy(&out.stderr).contains("interactive terminal"));
-    assert_eq!(f.run(&["--tui", "--interactive"]).status.code(), Some(2));
+    let out = f.run(&[]);
+    assert!(out.status.success());
+    let text = stdout(&out);
+    assert!(text.contains("grep-style syntax") && text.contains("geg --help"));
+    assert!(!text.contains("| path |") && !text.contains('\u{1b}'));
+    assert!(out.stderr.is_empty());
+    assert_eq!(f.run(&["--tui"]).status.code(), Some(2));
+    assert!(!stdout(&f.run(&["--help"])).contains("--tui"));
+}
+
+#[test]
+fn pretty_output_color_policy_and_jsonl_precedence() {
+    let f = Fixture::new();
+    f.seed("task: search result | query: login", true);
+    f.seed("title: none | text: security\n", true);
+    fs::write(f.dir.path().join("a.txt"), "security\n").unwrap();
+    let plain = f.run(&["--pretty", "login", "a.txt"]);
+    let text = stdout(&plain);
+    assert!(text.contains("result(s)") && text.contains("a.txt") && text.contains("similarity"));
+    assert!(text.contains("│ security") && !text.contains('\u{1b}'));
+    let colored = f.run(&["--pretty", "--color", "always", "login", "a.txt"]);
+    assert!(stdout(&colored).contains("\u{1b}[1;36m"));
+    let never = f.run(&["--format", "pretty", "--color", "never", "login", "a.txt"]);
+    assert!(!stdout(&never).contains('\u{1b}'));
+    let json = f.run(&["--pretty", "--color", "always", "--jsonl", "login", "a.txt"]);
+    let hit: serde_json::Value = serde_json::from_str(&stdout(&json)).unwrap();
+    assert_eq!(hit["path"], "a.txt");
 }
 
 #[test]

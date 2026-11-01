@@ -7,12 +7,13 @@ mod config;
 mod embedding;
 mod index;
 mod input;
+mod pretty;
 mod progress;
 mod search;
 mod tui;
 
 use std::{
-    io::{self, BufRead, Read, Write},
+    io::{self, BufRead, IsTerminal, Read, Write},
     path::PathBuf,
     process::ExitCode,
 };
@@ -43,6 +44,13 @@ fn run(args: &mut Args, matches: &clap::ArgMatches) -> Result<u8> {
         io::stdout()
             .lock()
             .write_all(include_str!("../skills/geg/SKILL.md").as_bytes())?;
+        return Ok(0);
+    }
+    if args.command.is_none() && args.query.is_none() && !args.tui && !args.interactive {
+        writeln!(
+            io::stdout().lock(),
+            "geg uses grep-style syntax: geg [OPTIONS] QUERY [FILE...]\nExample: geg --code 'retry logic' src/\nQueries use semantic similarity, not regular expressions. Run geg --help for options.\nIn an interactive terminal, run geg without a query to open the finder."
+        )?;
         return Ok(0);
     }
     ensure!(
@@ -181,6 +189,9 @@ fn print_response(out: &mut impl Write, response: &search::Response, args: &Args
         }
         return Ok(());
     }
+    if !args.json && (args.pretty || args.format == "pretty") {
+        return pretty::print(out, response, args);
+    }
     if !args.json && args.format == "md" {
         if !response.hits.is_empty() {
             writeln!(out, "| path | line | score | text |")?;
@@ -269,19 +280,20 @@ fn normalize_args(args: &mut Args) -> Result<()> {
     if args.command.is_some() {
         return Ok(());
     }
-    if args.tui {
-        if args.paths.is_empty()
-            && args
-                .query
-                .as_ref()
-                .is_some_and(|query| std::path::Path::new(query).exists())
-            && let Some(path) = args.query.take()
-        {
-            args.paths.push(PathBuf::from(path));
-        }
-        if args.paths.is_empty() {
-            args.paths.push(PathBuf::from("."));
-        }
+    if args.query.is_none()
+        && args.paths.is_empty()
+        && !args.interactive
+        && args.patterns.is_empty()
+        && args.pattern_files.is_empty()
+        && io::stdin().is_terminal()
+        && io::stderr().is_terminal()
+        && !args.quiet
+        && !args.count
+        && !args.files_with_matches
+        && !args.files_without_match
+    {
+        args.tui = true;
+        args.paths.push(PathBuf::from("."));
     }
     if args.interactive {
         ensure!(
@@ -322,6 +334,7 @@ fn main() -> ExitCode {
     };
     let result = run(&mut args, &matches);
     if result.is_ok()
+        && (args.query.is_some() || args.command.is_some() || args.tui || args.interactive)
         && !matches!(args.command, Some(Command::Skill))
         && let Ok(root) = cache_dir()
     {

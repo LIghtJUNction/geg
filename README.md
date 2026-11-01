@@ -27,7 +27,7 @@ geg --code '失败请求的重试逻辑' src/
 geg --code --jsonl -k 5 'validate passwords before login' src/
 
 # 像 fzf 一样边输入边筛选，Tab 打开源码预览
-geg --tui --code src/
+geg --code                             # 终端中无查询时，浏览当前目录
 
 # 大仓库反复检索：建完整索引，然后直接搜索
 geg index src/ docs/                 # ./.geg/index.sqlite3
@@ -119,9 +119,17 @@ geg -f queries.txt src/                  # 每行一个语义查询，OR 匹配
 # JSONL：每条结果一个对象，不混入表头或状态日志
 geg --code --jsonl 'password verification' src/
 
+# 给人看的源码卡片：文件位置、相似度、带行号的代码
+geg --pretty --code '主函数' src/
+geg --pretty --color always --code 'GPU inference' src/  # 显式强制 ANSI 色彩
+
 # grep 风格的逐行输出，适合已有文本处理脚本
 geg --format grep -nH --score 'password verification' src/
 ```
+
+`--pretty` 等价于 `--format pretty`，彩色卡片不会使用 Markdown 转义。`--color auto` 默认仅在输出终端且未设置 `NO_COLOR` 时加色；`--color never` 禁止颜色，重定向默认不含 ANSI。`--jsonl` 优先于 pretty，机器输出不混入色彩。
+
+快速 `--code` 使用语义分数、词法匹配与真实符号声明共同排序；`score` 仍是原始余弦相似度，不代表置信概率，也不保证严格按该列降序。目录扫描优先源代码，跳过锁文件、压缩 JS、README 等非源码，减少样例和依赖元数据淹没实现；显式指定文件与完整扫描不受此快速过滤限制。每个文件保留有限候选，避免一份文件占满预算；有界中英文代码术语提示只是召回辅助，不能代替完整语义索引。
 
 JSONL 的结果结构为：
 
@@ -258,10 +266,13 @@ geg --cache /private/cache.db cache info
 ## fzf 风格交互搜索
 
 ```sh
-geg --tui src/                         # 边输入边模糊筛选文件
-geg --tui --code 'retry failed requests' src/
-geg --tui --jsonl src/                 # Enter 后只输出选中项的 JSONL
+cd /path/to/repository
+geg                                   # 有交互式 TTY：默认进入当前目录的 finder
+geg --code                            # 输入问题后使用代码检索指令重排
+geg --code --jsonl                    # Enter 后只输出选中项的 JSONL
 ```
+
+无参数时自动检查 stdin/stderr 的 TTY：交互式环境进入 finder；无 TTY 的 agent/脚本环境只打印一段 grep 风格语法和 `geg --help` 提示，成功退出且不加载模型。没有 `tui` 子命令或 `--tui` 开关，带查询则照常搜索。
 
 独立的原生终端界面，**不要求安装 fzf**。列表从底部向上排列，最佳结果和输入栏相邻：
 
@@ -430,6 +441,9 @@ cargo clippy --all-targets --locked -- -D warnings
 cargo test --release --locked
 cargo doc --no-deps --locked
 python3 scripts/test_tui.py --binary target/release/geg  # Unix PTY，无需桌面或模型
+# 真实本地模型：检索当前 geg 源码，按函数/代码行锚点检查，不只对文件名
+python3 scripts/test_relevance.py --binary target/release/geg \
+  --model "$GEG_MODEL" --require-entry --min-hit-at-10 9
 # 可选：真实 GPU、同一上下文两轮查询、选中退出和终端恢复回归
 python3 scripts/test_tui.py --binary target/release/geg \
   --model "$GEG_MODEL" --repository /path/to/AstrBot
@@ -439,6 +453,8 @@ cargo install --path . --locked
 ```
 
 默认测试使用明确标注的预置向量，不下载模型；覆盖管道、退出码、表格转义、配置优先级、ignore、增量索引、回滚、向量单份存储、缓存管理及提示。PTY 回归另测 Esc/Enter、中文编辑、模糊筛选、Tab 预览、stdout 纯净和退出后终端状态恢复。可选的真实 GPU PTY 回归另外验证两轮语义查询和后台线程安全退出。真实 GGUF 推理另行实测，不把预置向量测试当作模型质量评测。可选 CUDA/native 特性需对应工具链；不要在缺少 CUDA 环境时盲目使用 `--all-features`。
+
+本轮自检的 9 个中文问题中，真实实现命中 Top 1 为 **4/9**、Top 3 为 **6/9**、Top 10 为 **9/9**；“主函数”命中实际 Rust 入口并排第 1。配置优先级、终端恢复、缓存清理的目标代码虽在 Top 10，但排序仍需改善。测试使用当前开发树、RTX 4060 Laptop GPU 和已存在的模型/向量缓存；耗时混有缓存命中，**不是冷启动速度或通用准确率承诺**。新增问题时应现场核对实际代码，避免只围绕这 9 个问题优化。
 
 ## English
 
@@ -455,7 +471,7 @@ geg cache info
 geg cache clean
 ```
 
-`geg --tui src/` opens a built-in fzf-style picker: bottom prompt, live fuzzy filtering, debounced background semantic reranking, Tab preview, Enter to select. No external fzf required. Headless agents should use `--interactive` instead.
+Bare `geg` opens a built-in fzf-style picker when stdin/stderr have an interactive TTY: bottom prompt, live fuzzy filtering, debounced background semantic reranking, Tab preview, Enter to select. Without a TTY it prints concise grep-style usage and `--help`, without loading weights. There is no `tui` subcommand or `--tui` flag. `--pretty` renders human-readable result cards, with `--color auto|always|never`; `--jsonl` stays machine-readable. Headless agents can use explicit queries or the `--interactive` JSON protocol.
 
 Default unindexed retrieval lexically shortlists 32 chunks and semantically reranks them. It can miss relevant paraphrases; use `--exhaustive` or a full index for broader semantic recall. Ignore files are respected by default, and recursive traversal always excludes `.git` and `.geg`. Configuration: project/global `.gegrc.toml`; CLI/environment override config. Models are provisioned separately. Indexes contain source excerpts; keep them private. `cache clean` preserves models and project indexes.
 

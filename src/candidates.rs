@@ -1,7 +1,7 @@
 //! Bounded first-pass retrieval for unindexed repositories. Not exhaustive semantic search.
 use crate::{
     input,
-    search::{Hit, Response, Searcher, Stats, best_score, insert_hit},
+    search::{Hit, Response, Searcher, Stats, best_score},
 };
 use anyhow::{Result, ensure};
 use std::{
@@ -18,6 +18,7 @@ struct Candidate {
     line: u64,
     text: String,
     lexical: f32,
+    test_only: bool,
 }
 impl PartialEq for Candidate {
     fn eq(&self, other: &Self) -> bool {
@@ -44,6 +45,7 @@ struct Selection {
     matcher: nucleo::Matcher,
     chunks: BinaryHeap<Reverse<Candidate>>,
     limit: usize,
+    code: bool,
 }
 
 fn is_cjk(c: char) -> bool {
@@ -69,7 +71,165 @@ fn terms(query: &str) -> Vec<String> {
             terms.insert(pair.iter().collect());
         }
     }
+    // Transparent, bounded query hints, not a general translation model. The original
+    // query still drives embedding similarity; these only improve candidate recall.
+    for (chinese, english) in [
+        ("主函数", &["main", "entrypoint"][..]),
+        ("入口", &["main", "entrypoint"]),
+        ("哈希", &["hash", "blake3"]),
+        ("缓存", &["cache"]),
+        ("重试", &["retry", "backoff"]),
+        ("鉴权", &["auth", "authentication"]),
+        ("权限", &["permission", "denied"]),
+        ("清理", &["clean", "remove"]),
+        ("配置", &["config", "configuration"]),
+        ("分块", &["chunks", "chunk"]),
+        ("向量", &["vector", "embedding"]),
+        ("模型", &["model"]),
+        ("进度", &["progress"]),
+        ("键盘", &["key", "event"]),
+        ("终端", &["terminal"]),
+        ("退出", &["drop", "shutdown"]),
+        ("恢复", &["restore", "disable_raw_mode"]),
+        ("删除", &["delete", "clean", "remove"]),
+        ("编码", &["encode"]),
+        ("序列", &["sequence"]),
+        ("彩色", &["color", "colored", "pretty"]),
+        ("输出", &["print", "output"]),
+    ] {
+        if query.contains(chinese) {
+            terms.extend(english.iter().map(|s| (*s).to_owned()));
+        }
+    }
     terms.into_iter().collect()
+}
+
+fn generated(path: &Path) -> bool {
+    let name = path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_lowercase();
+    name.ends_with(".lock")
+        || name.ends_with("-lock.json")
+        || name.ends_with(".min.js")
+        || matches!(
+            name.as_str(),
+            "go.sum" | "pnpm-lock.yaml" | "npm-shrinkwrap.json"
+        )
+}
+
+fn declaration_match(terms: &[String], text: &str) -> bool {
+    let lower = text.to_lowercase();
+    lower.lines().any(|line| {
+        let mut line = line.trim_start();
+        for qualifier in [
+            "pub ",
+            "pub(crate) ",
+            "pub(super) ",
+            "export ",
+            "default ",
+            "async ",
+            "unsafe ",
+        ] {
+            if let Some(rest) = line.strip_prefix(qualifier) {
+                line = rest;
+            }
+        }
+        ["fn ", "def ", "func ", "function ", "class ", "int "]
+            .iter()
+            .any(|prefix| {
+                line.strip_prefix(prefix).is_some_and(|body| {
+                    terms
+                        .iter()
+                        .filter(|t| t.is_ascii() && t.len() >= 3)
+                        .any(|term| {
+                            body.strip_prefix(term.as_str())
+                                .is_some_and(|tail| tail.starts_with(['(', '<', ':', ' ']))
+                        })
+                })
+            })
+    })
+}
+
+fn identifiers(text: &str) -> String {
+    // Downweight mentions inside examples/comments without changing the embedded source.
+    let mut output = String::with_capacity(text.len());
+    let mut quoted = false;
+    let mut escaped = false;
+    for line in text.lines() {
+        let mut chars = line.chars().peekable();
+        while let Some(c) = chars.next() {
+            if !quoted
+                && ((c == '/' && chars.peek() == Some(&'/'))
+                    || (c == '#' && line.trim_start().starts_with("# ")))
+            {
+                break;
+            }
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            if quoted && c == '\\' {
+                escaped = true;
+                continue;
+            }
+            if c == '"' {
+                quoted = !quoted;
+                output.push(' ');
+                continue;
+            }
+            if !quoted {
+                output.push(c);
+            }
+        }
+        output.push('\n');
+    }
+    output
+}
+
+fn implementation_content(text: &str, in_import: &mut bool) -> bool {
+    let mut meaningful = false;
+    for line in text.lines().map(str::trim) {
+        if *in_import {
+            if line.contains(';') {
+                *in_import = false;
+            }
+            continue;
+        }
+        if line.starts_with("use ") || line.starts_with("pub use ") {
+            *in_import = !line.contains(';');
+            continue;
+        }
+        if line.starts_with("import ")
+            || line.starts_with("from ")
+            || line.starts_with("package ")
+            || line.starts_with("#include")
+            || line.starts_with("#[")
+            || line.starts_with("//")
+            || (line.starts_with("mod ") && line.ends_with(';'))
+            || line == "Ok(())"
+        {
+            continue;
+        }
+        if line.chars().any(char::is_alphanumeric) {
+            meaningful = true;
+        }
+    }
+    meaningful
+}
+
+fn source_priority(path: &str) -> f32 {
+    match Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+    {
+        "rs" | "py" | "js" | "jsx" | "ts" | "tsx" | "c" | "cc" | "cpp" | "h" | "hpp" | "go"
+        | "java" | "kt" | "swift" | "cs" | "rb" | "php" | "sh" | "ex" | "exs" | "lua" | "zig"
+        | "scala" | "vue" | "svelte" => 4.0,
+        _ => 0.0,
+    }
 }
 
 impl Selection {
@@ -93,6 +253,7 @@ impl Selection {
             matcher: nucleo::Matcher::new(nucleo::Config::DEFAULT.match_paths()),
             chunks: BinaryHeap::with_capacity(limit),
             limit,
+            code: false,
         }
     }
     fn offer(&mut self, candidate: Candidate) {
@@ -125,39 +286,79 @@ impl Selection {
             .filter_map(|atom| atom.score(path_text, &mut self.matcher))
             .map(|score| (f32::from(score) / 64.0).min(1.5))
             .sum();
+        // Reserve room for other files instead of letting a single lockfile or
+        // repeated boilerplate occupy the entire reranking budget.
+        let file_limit = if self.code {
+            self.limit.div_ceil(4).max(1)
+        } else {
+            self.limit
+        };
+        let mut file = Selection::new(Vec::new(), file_limit);
+        let mut in_import = false;
+        let mut test_only = false;
         input::chunks(reader, chunk_lines, |line, text| {
             if !input::searchable(text) {
                 return Ok(());
             }
             stats.chunks += 1;
+            if self.code && !implementation_content(text, &mut in_import) {
+                return Ok(());
+            }
+            test_only |= text.contains("#[cfg(test)]");
             let lower = text.to_lowercase();
+            let identifiers = if self.code {
+                identifiers(&lower)
+            } else {
+                lower.clone()
+            };
             let lexical: f32 = self
                 .terms
                 .iter()
                 .map(|term| {
                     let weight = (term.chars().count() as f32).sqrt();
                     weight
-                        * (lower.matches(term.as_str()).take(3).count() as f32
+                        * (identifiers.matches(term.as_str()).take(3).count() as f32
+                            + if self.code {
+                                0.15 * lower.matches(term.as_str()).take(3).count() as f32
+                            } else {
+                                0.0
+                            }
                             + if lower_path.contains(term) { 2.0 } else { 0.0 })
                 })
                 .sum::<f32>();
-            let lexical = (lexical + fuzzy_bonus) / (1.0 + text.len() as f32 / 2048.0);
-            let worth_keeping = self.chunks.len() < self.limit
-                || self.chunks.peek().is_some_and(|worst| {
+            let prior = if self.code {
+                source_priority(&lower_path)
+            } else {
+                0.0
+            };
+            let symbol_bonus = if self.code && declaration_match(&self.terms, text) {
+                12.0
+            } else {
+                0.0
+            };
+            let lexical =
+                (lexical + fuzzy_bonus + prior + symbol_bonus) / (1.0 + text.len() as f32 / 2048.0);
+            let worth_keeping = file.chunks.len() < file.limit
+                || file.chunks.peek().is_some_and(|worst| {
                     lexical.total_cmp(&worst.0.lexical).is_gt()
                         || (lexical == worst.0.lexical
                             && (path, line) < (worst.0.path.as_str(), worst.0.line))
                 });
             if worth_keeping {
-                self.offer(Candidate {
+                file.offer(Candidate {
                     path: path.to_owned(),
                     line,
                     text: text.to_owned(),
                     lexical,
+                    test_only,
                 });
             }
             Ok(())
-        })
+        })?;
+        for candidate in file.chunks {
+            self.offer(candidate.0);
+        }
+        Ok(())
     }
 }
 
@@ -166,7 +367,10 @@ impl Searcher<'_> {
         self.progress
             .begin("scanning text and selecting candidates (no full-repository embedding)");
         let mut stats = Stats::default();
-        let mut selection = Selection::new(terms(query), self.args.candidates as usize);
+        let mut selection = Selection {
+            code: self.args.code,
+            ..Selection::new(terms(query), self.args.candidates as usize)
+        };
         let paths = self.args.paths.clone();
         if paths.is_empty() {
             ensure!(
@@ -196,10 +400,10 @@ impl Searcher<'_> {
         }
         stats.candidate_chunks = selection.chunks.len() as u64;
         if stats.chunks > stats.candidate_chunks && !self.args.quiet && !self.args.no_messages {
-            eprintln!(
+            self.progress.message(format!(
                 "geg: fast search: scanned {} chunks in {} files, semantically reranking {} lexical candidates. This is not exhaustive; use --exhaustive or a full index for broader semantic recall.",
                 stats.chunks, stats.files, stats.candidate_chunks
-            );
+            ));
         }
         if stats.skipped_files > 0 && !self.args.no_messages && !self.args.quiet {
             eprintln!(
@@ -209,7 +413,9 @@ impl Searcher<'_> {
         }
         let mut counts = BTreeMap::new();
         let mut hits = Vec::new();
+        let query_terms = selection.terms.clone();
         let chunks = selection.ordered();
+        let mut ranked = Vec::new();
         if !chunks.is_empty() {
             let query_vector = self.query_vector(query, &mut stats)?;
             let prompts: Vec<_> = chunks
@@ -222,18 +428,54 @@ impl Searcher<'_> {
                 let count = counts.entry(candidate.path.clone()).or_insert(0);
                 if self.accepts(score) {
                     *count += candidate.text.lines().count() as u64;
-                    insert_hit(
-                        &mut hits,
+                    let rank = if self.args.code {
+                        let symbol = if declaration_match(&query_terms, &candidate.text) {
+                            0.15
+                        } else {
+                            0.0
+                        };
+                        let support = (candidate.test_only
+                            || Path::new(&candidate.path).components().any(|part| {
+                                matches!(part.as_os_str().to_str(), Some("tests" | "scripts"))
+                            }))
+                            && !query_terms.iter().any(|term| {
+                                [
+                                    "test",
+                                    "tests",
+                                    "script",
+                                    "scripts",
+                                    "benchmark",
+                                    "regression",
+                                    "测试",
+                                    "脚本",
+                                ]
+                                .contains(&term.as_str())
+                            });
+                        let support_penalty = if support { 0.25 } else { 0.0 };
+                        0.6 * score + 0.4 * candidate.lexical / (candidate.lexical + 8.0) + symbol
+                            - support_penalty
+                    } else {
+                        score
+                    };
+                    ranked.push((
+                        rank,
                         Hit {
                             path: candidate.path,
                             line: candidate.line,
                             text: candidate.text,
                             score,
                         },
-                        self.limit(),
-                    );
+                    ));
                 }
             }
+        }
+        ranked.sort_unstable_by(|(a, x), (b, y)| {
+            b.total_cmp(a)
+                .then_with(|| x.path.cmp(&y.path))
+                .then_with(|| x.line.cmp(&y.line))
+        });
+        for (_, hit) in ranked.into_iter().take(self.limit()) {
+            hits.push(hit);
         }
         self.progress.finish(&stats);
         Ok(Response {
@@ -269,7 +511,10 @@ impl Searcher<'_> {
             }
         }
         let merged = Mutex::new((
-            Selection::new(selection.terms.clone(), selection.limit),
+            Selection {
+                code: selection.code,
+                ..Selection::new(selection.terms.clone(), selection.limit)
+            },
             Stats::default(),
             None,
         ));
@@ -277,6 +522,7 @@ impl Searcher<'_> {
         let cancellation = self.revision.clone();
         let terms = selection.terms.clone();
         let limit = selection.limit;
+        let code = selection.code;
         let mut walker = input::walker(
             path,
             self.args.no_ignore,
@@ -286,7 +532,10 @@ impl Searcher<'_> {
         walker.threads(std::thread::available_parallelism().map_or(1, |n| n.get().min(4)));
         walker.build_parallel().run(|| {
             let mut local = Local {
-                selection: Selection::new(terms.clone(), limit),
+                selection: Selection {
+                    code,
+                    ..Selection::new(terms.clone(), limit)
+                },
                 stats: Stats::default(),
                 merged: &merged,
             };
@@ -299,6 +548,14 @@ impl Searcher<'_> {
                 }
                 let entry = match entry {
                     Ok(entry) => entry,
+                    Err(error)
+                        if error
+                            .io_error()
+                            .is_some_and(|e| e.kind() == std::io::ErrorKind::PermissionDenied) =>
+                    {
+                        local.stats.skipped_files += 1;
+                        return ignore::WalkState::Continue;
+                    }
                     Err(error) => {
                         local.merged.lock().expect("candidate merge poisoned").2 =
                             Some(error.into());
@@ -306,6 +563,12 @@ impl Searcher<'_> {
                     }
                 };
                 if !entry.file_type().is_some_and(|kind| kind.is_file()) {
+                    return ignore::WalkState::Continue;
+                }
+                if code
+                    && (generated(entry.path())
+                        || source_priority(&entry.path().to_string_lossy().to_lowercase()) == 0.0)
+                {
                     return ignore::WalkState::Continue;
                 }
                 local.stats.files += 1;
@@ -378,6 +641,7 @@ mod tests {
             line: i,
             text: String::new(),
             lexical: (i % 4) as f32,
+            test_only: false,
         };
         for i in 0..100 {
             selection.offer(make(i));
@@ -396,6 +660,62 @@ mod tests {
             selection.collect("same body\n".as_bytes(), path, 1, &mut stats)?;
         }
         assert_eq!(selection.ordered()[0].path, "src/requestRetry.rs");
+        Ok(())
+    }
+    #[test]
+    fn declarations_ignore_quoted_examples_and_import_only_chunks() {
+        let terms = terms("主函数");
+        assert_eq!(
+            identifiers("let sample = \"fn main() {}\"; // main\n"),
+            "let sample =   ; \n"
+        );
+        assert!(declaration_match(&terms, "pub async fn main() {}"));
+        assert!(!declaration_match(
+            &terms,
+            "let example = \"fn main() {}\";"
+        ));
+        assert!(!declaration_match(&terms, "// fn main() {}"));
+        let mut imported = false;
+        assert!(!implementation_content(
+            "use std::{\n    fs,\n",
+            &mut imported
+        ));
+        assert!(!implementation_content(
+            "    io,\n};\nmod cache;\nOk(())\n",
+            &mut imported
+        ));
+        assert!(implementation_content(
+            "fn main() { run(); }",
+            &mut imported
+        ));
+    }
+    #[test]
+    fn chinese_entry_query_keeps_real_code_and_limits_single_file_boilerplate() -> Result<()> {
+        let mut selection = Selection {
+            code: true,
+            ..Selection::new(terms("主函数"), 32)
+        };
+        let mut stats = Stats::default();
+        selection.collect(
+            "主函数 main example\n".repeat(100).as_bytes(),
+            "README.md",
+            1,
+            &mut stats,
+        )?;
+        let source = format!(
+            "{}fn main() {{ run(); }}\n",
+            "use crate::something;\n".repeat(64)
+        );
+        selection.collect(source.as_bytes(), "src/main.rs", 1, &mut stats)?;
+        let chunks = selection.ordered();
+        assert!(
+            chunks
+                .iter()
+                .any(|c| c.path == "src/main.rs" && c.text.contains("fn main"))
+        );
+        assert!(chunks.iter().filter(|c| c.path == "README.md").count() <= 8);
+        assert!(generated(Path::new("Cargo.lock")) && generated(Path::new("package-lock.json")));
+        assert!(!generated(Path::new("src/main.rs")));
         Ok(())
     }
     #[test]

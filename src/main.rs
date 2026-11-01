@@ -1,0 +1,243 @@
+//! Offline semantic grep with a local EmbeddingGemma GGUF model.
+mod cache;
+mod cli;
+mod embedding;
+mod index;
+mod input;
+mod search;
+
+use std::{
+    io::{self, BufRead, Read, Write},
+    path::PathBuf,
+    process::ExitCode,
+};
+
+use anyhow::{Context, Result, ensure};
+use clap::Parser;
+use directories::ProjectDirs;
+
+use crate::{
+    cache::Cache,
+    cli::{Args, Command},
+    search::Searcher,
+};
+
+fn cache_dir() -> Result<PathBuf> {
+    Ok(ProjectDirs::from("", "", "geg")
+        .context("cannot locate user cache directory; set --cache and --model")?
+        .cache_dir()
+        .to_owned())
+}
+
+fn run(args: &mut Args) -> Result<u8> {
+    normalize_args(args)?;
+    if matches!(args.command, Some(Command::Skill)) {
+        io::stdout()
+            .lock()
+            .write_all(include_str!("../skills/geg/SKILL.md").as_bytes())?;
+        return Ok(0);
+    }
+    ensure!(
+        args.threshold.is_finite() && (-1.0..=1.0).contains(&args.threshold),
+        "--threshold must be finite and between -1 and 1"
+    );
+    let defaults = cache_dir()?;
+    let model = args
+        .model
+        .clone()
+        .unwrap_or_else(|| defaults.join("models/embeddinggemma-2-UD-Q4_K_XL.gguf"));
+    let cache_path = args
+        .cache
+        .clone()
+        .unwrap_or_else(|| defaults.join("vectors.sqlite3"));
+    let cache = Cache::open(if args.no_cache {
+        None
+    } else {
+        Some(&cache_path)
+    })?;
+    let mut searcher = Searcher::new(args, model, cache)?;
+    let stdout = io::stdout();
+    let mut out = io::BufWriter::new(stdout.lock());
+    if let Some(command) = &args.command {
+        return match command {
+            Command::Skill => unreachable!("skill command handled before model setup"),
+            Command::Index { paths, output } => {
+                let path = if let Some(path) = output {
+                    path.clone()
+                } else {
+                    index::default_path(&defaults, paths)?
+                };
+                let stats = searcher.build_index(paths, &path)?;
+                serde_json::to_writer(
+                    &mut out,
+                    &serde_json::json!({"index": path, "stats": stats}),
+                )?;
+                writeln!(out)?;
+                out.flush()?;
+                Ok(0)
+            }
+            Command::Query { query, index } => {
+                let response = searcher.search_index(query, index)?;
+                let matched = response.matched(args);
+                print_response(&mut out, &response, args)?;
+                out.flush()?;
+                Ok(u8::from(!matched))
+            }
+        };
+    }
+    if args.interactive {
+        ensure!(
+            !args.paths.is_empty() && args.paths.iter().all(|p| p != std::path::Path::new("-")),
+            "--interactive requires file/directory paths after '--'"
+        );
+        let mut reader = io::stdin().lock();
+        let mut line = Vec::new();
+        loop {
+            line.clear();
+            // Bound protocol frames too, not just file chunks.
+            let n = std::io::Read::by_ref(&mut reader)
+                .take(1026)
+                .read_until(b'\n', &mut line)?;
+            if n == 0 {
+                break;
+            }
+            ensure!(n <= 1025, "interactive query line exceeds 1024 bytes");
+            let query = std::str::from_utf8(&line)?.trim_end_matches(['\n', '\r']);
+            match searcher.search(query) {
+                Ok(response) => serde_json::to_writer(&mut out, &response)?,
+                Err(error) => serde_json::to_writer(
+                    &mut out,
+                    &serde_json::json!({"query": query, "error": format!("{error:#}")}),
+                )?,
+            }
+            writeln!(out)?;
+            out.flush()?;
+        }
+        return Ok(0);
+    }
+    let query = args
+        .query
+        .as_deref()
+        .context("provide a query or a subcommand (see --help)")?;
+    let response = searcher.search(query)?;
+    let matched = response.matched(args);
+    print_response(&mut out, &response, args)?;
+    out.flush()?;
+    Ok(u8::from(!matched))
+}
+
+fn print_response(out: &mut impl Write, response: &search::Response, args: &Args) -> Result<()> {
+    if args.quiet {
+        return Ok(());
+    }
+    let filename = args.with_filename || (!args.no_filename && response.counts.len() > 1);
+    if args.files_with_matches || args.files_without_match || args.count {
+        for (path, &count) in &response.counts {
+            if args.files_with_matches || args.files_without_match {
+                if (args.files_with_matches && count > 0)
+                    || (args.files_without_match && count == 0)
+                {
+                    writeln!(out, "{}", safe_text(path))?;
+                }
+            } else if filename {
+                writeln!(out, "{}:{count}", safe_text(path))?;
+            } else {
+                writeln!(out, "{count}")?;
+            }
+        }
+        return Ok(());
+    }
+    for hit in &response.hits {
+        if args.json {
+            serde_json::to_writer(&mut *out, hit)?;
+            writeln!(out)?;
+            if args.line_buffered {
+                out.flush()?;
+            }
+        } else {
+            for (offset, line) in hit.text.lines().enumerate() {
+                if filename {
+                    write!(out, "{}:", safe_text(&hit.path))?;
+                }
+                if args.line_number {
+                    write!(out, "{}:", hit.line + offset as u64)?;
+                }
+                if args.score {
+                    write!(out, "{:.4}:", hit.score)?;
+                }
+                writeln!(out, "{}", safe_text(line))?;
+                if args.line_buffered {
+                    out.flush()?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn safe_text(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for c in text.chars() {
+        if c.is_control() && c != '\t' {
+            escaped.extend(c.escape_default());
+        } else {
+            escaped.push(c);
+        }
+    }
+    escaped
+}
+
+fn normalize_args(args: &mut Args) -> Result<()> {
+    if args.command.is_some() {
+        return Ok(());
+    }
+    if args.interactive {
+        ensure!(
+            args.patterns.is_empty() && args.pattern_files.is_empty(),
+            "--interactive cannot be combined with -e/-f"
+        );
+        if let Some(path) = args.query.take() {
+            args.paths.insert(0, PathBuf::from(path));
+        }
+    } else if !args.patterns.is_empty() || !args.pattern_files.is_empty() {
+        if let Some(path) = args.query.take() {
+            args.paths.insert(0, PathBuf::from(path));
+        }
+        let mut patterns = args.patterns.clone();
+        for path in &args.pattern_files {
+            let mut text = String::new();
+            if path == std::path::Path::new("-") {
+                io::Read::take(io::stdin().lock(), 65537).read_to_string(&mut text)?;
+            } else {
+                io::Read::take(std::fs::File::open(path)?, 65537).read_to_string(&mut text)?;
+            }
+            ensure!(text.len() <= 65536, "query file exceeds 64 KiB");
+            patterns.extend(text.lines().map(str::to_owned));
+        }
+        args.query = Some(patterns.join("\n"));
+    }
+    if args.paths.is_empty() && (args.recursive || args.dereference_recursive) {
+        args.paths.push(PathBuf::from("."));
+    }
+    Ok(())
+}
+
+fn main() -> ExitCode {
+    let mut args = Args::parse();
+    match run(&mut args) {
+        Ok(code) => ExitCode::from(code),
+        Err(error)
+            if error
+                .downcast_ref::<io::Error>()
+                .is_some_and(|e| e.kind() == io::ErrorKind::BrokenPipe) =>
+        {
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            if !args.no_messages {
+                eprintln!("geg: {error:#}");
+            }
+            ExitCode::from(2)
+        }
+    }
+}

@@ -1,0 +1,35 @@
+[package]
+name = "geg"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Geg Embeds Gemma: offline semantic grep with EmbeddingGemma 2 and persistent vector caching"
+license = "MIT"
+repository = "https://github.com/LIghtJUNction/geg"
+readme = "README.md"
+keywords = ["semantic-search", "grep", "embeddings", "gemma", "cli"]
+categories = ["command-line-utilities", "text-processing"]
+include = ["src/**", "tests/**", "Cargo.toml", "Cargo.lock", "README.md", "LICENSE", "skills/geg/SKILL.md", "scripts/benchmark.py"]
+
+[dependencies]
+anyhow = "1"
+blake3 = "1"
+clap = { version = "4", features = ["derive", "env"] }
+directories = "6"
+ignore = "0.4"
+llama-cpp-4 = { version = "=0.9.0", default-features = false }
+rusqlite = { version = "0.38", features = ["bundled"] }
+self_cell = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"

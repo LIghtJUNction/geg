@@ -1,0 +1,9 @@
+/target/
+*.gguf
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+*.db
+*.db-wal
+*.db-shm
+.DS_Store

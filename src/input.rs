@@ -77,10 +77,15 @@ pub fn chunks(
     Ok(())
 }
 
-pub fn visit_files(paths: &[PathBuf], mut visit: impl FnMut(&Path) -> Result<()>) -> Result<()> {
+pub fn visit_files(
+    paths: &[PathBuf],
+    no_ignore: bool,
+    hidden: bool,
+    mut visit: impl FnMut(&Path) -> Result<()>,
+) -> Result<()> {
     for path in paths {
         if path.is_dir() {
-            for entry in ignore::WalkBuilder::new(path).follow_links(false).build() {
+            for entry in walker(path, no_ignore, hidden, false).build() {
                 let entry = entry?;
                 if entry.file_type().is_some_and(|kind| kind.is_file()) {
                     visit(entry.path())?;
@@ -91,6 +96,31 @@ pub fn visit_files(paths: &[PathBuf], mut visit: impl FnMut(&Path) -> Result<()>
         }
     }
     Ok(())
+}
+
+/// Punctuation-only fragments (for example a closing brace) have no semantic content.
+pub fn searchable(text: &str) -> bool {
+    text.chars().any(char::is_alphanumeric)
+}
+
+/// Shared traversal rules for direct search and explicit indexing.
+pub fn walker(
+    path: &Path,
+    no_ignore: bool,
+    hidden: bool,
+    follow_links: bool,
+) -> ignore::WalkBuilder {
+    let mut builder = ignore::WalkBuilder::new(path);
+    builder
+        .require_git(false)
+        .follow_links(follow_links)
+        .hidden(!hidden)
+        .ignore(!no_ignore)
+        .git_ignore(!no_ignore)
+        .git_global(!no_ignore)
+        .git_exclude(!no_ignore)
+        .filter_entry(|entry| entry.file_name() != ".geg" && entry.file_name() != ".git");
+    builder
 }
 
 #[cfg(test)]

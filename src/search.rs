@@ -6,7 +6,6 @@ use std::{
 };
 
 use anyhow::{Context, Result, ensure};
-use ignore::WalkBuilder;
 use serde::Serialize;
 
 use crate::{
@@ -19,7 +18,7 @@ use crate::{
 // One suggestion per process; never pre-walk the tree just to count files.
 const INDEX_HINT_FILES: u64 = 100;
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Hit {
     pub path: String,
     pub line: u64,
@@ -33,6 +32,8 @@ pub struct Stats {
     pub embedded: u64,
     pub chunks: u64,
     pub files: u64,
+    pub candidate_chunks: u64,
+    pub skipped_files: u64,
 }
 
 #[derive(Serialize)]
@@ -58,34 +59,78 @@ pub struct Searcher<'a> {
     model_path: PathBuf,
     pub(crate) model_hash: blake3::Hash,
     pub(crate) dimensions: usize,
-    cache: Cache,
+    pub(crate) cache: Cache,
+    index_cache: Cache,
     engine: Option<Engine>,
+    pub(crate) revision: Option<(std::sync::Arc<std::sync::atomic::AtomicU64>, u64)>,
     hint_emitted: bool,
+    pub(crate) progress: crate::progress::Progress,
 }
 
 impl<'a> Searcher<'a> {
     pub fn new(args: &'a Args, model_path: PathBuf, cache: Cache) -> Result<Self> {
+        let mut progress =
+            crate::progress::Progress::new(!args.quiet && !args.no_messages && !args.no_progress);
+        progress.begin("verifying local model identity");
         // Hash contents, not just mtime: replacing a model cannot reuse stale vectors.
         let mut file = File::open(&model_path).with_context(|| {
             format!(
-                "opening model {}; set --model/GEG_MODEL to a local EmbeddingGemma 2 GGUF",
+                "local model missing/unreadable at {}; geg does not download models. Prepare a text-only EmbeddingGemma 2 GGUF and set --model/GEG_MODEL (see README)",
                 model_path.display()
             )
         })?;
         let mut hash = blake3::Hasher::new();
         hash.update_reader(&mut file)?;
+        let index_path = args
+            .index_path
+            .clone()
+            .unwrap_or(crate::index::default_path()?);
+        let index_cache = if args.no_cache {
+            Cache::open(None)?
+        } else {
+            Cache::open_index(&index_path)?
+        };
         Ok(Self {
             args,
             model_path,
             model_hash: hash.finalize(),
             dimensions: args.dimensions.parse()?,
             cache,
+            index_cache,
             engine: None,
+            revision: None,
             hint_emitted: false,
+            progress,
         })
     }
 
+    pub(crate) fn set_revision(
+        &mut self,
+        revision: std::sync::Arc<std::sync::atomic::AtomicU64>,
+        expected: u64,
+    ) {
+        self.revision = Some((revision, expected));
+    }
+
+    pub(crate) fn check_cancelled(&self) -> Result<()> {
+        if let Some((revision, expected)) = &self.revision {
+            ensure!(
+                revision.load(std::sync::atomic::Ordering::Relaxed) == *expected,
+                "search superseded by a newer query"
+            );
+        }
+        Ok(())
+    }
+
+    pub(crate) fn cached_vector(&self, key: &blake3::Hash) -> Result<Option<Vec<f32>>> {
+        if let Some(vector) = self.cache.get(key, self.dimensions)? {
+            return Ok(Some(vector));
+        }
+        self.index_cache.get(key, self.dimensions)
+    }
+
     pub(crate) fn vector(&mut self, text: &str, stats: &mut Stats) -> Result<Vec<f32>> {
+        self.check_cancelled()?;
         let lowered;
         let text = if self.args.ignore_case {
             lowered = text.to_lowercase();
@@ -94,23 +139,95 @@ impl<'a> Searcher<'a> {
             text
         };
         let key = Cache::key(&self.model_hash, self.dimensions, text);
-        if let Some(vector) = self.cache.get(&key, self.dimensions)? {
+        if let Some(vector) = self.cached_vector(&key)? {
             stats.cache_hits += 1;
+            self.progress.update(stats);
             return Ok(vector);
         }
+        let vector = self.embed_uncached(text, stats)?;
+        self.cache.put(&key, &vector)?;
+        Ok(vector)
+    }
+
+    fn ensure_engine(&mut self) -> Result<()> {
         if self.engine.is_none() {
+            self.progress.loading(&self.model_path);
             let threads = self.args.threads.unwrap_or_else(|| {
                 std::thread::available_parallelism().map_or(1, |n| n.get().min(8) as u32)
             });
-            self.engine = Some(Engine::load(&self.model_path, threads, self.dimensions)?);
+            let engine = Engine::load(
+                &self.model_path,
+                threads,
+                self.dimensions,
+                &self.args.device,
+            )?;
+            self.progress.device(engine.device);
+            self.engine = Some(engine);
         }
+        Ok(())
+    }
+
+    pub(crate) fn vectors(
+        &mut self,
+        prompts: &[String],
+        stats: &mut Stats,
+    ) -> Result<Vec<Vec<f32>>> {
+        let prompts: Vec<String> = prompts
+            .iter()
+            .map(|text| {
+                if self.args.ignore_case {
+                    text.to_lowercase()
+                } else {
+                    text.clone()
+                }
+            })
+            .collect();
+        let keys: Vec<_> = prompts
+            .iter()
+            .map(|text| Cache::key(&self.model_hash, self.dimensions, text))
+            .collect();
+        let mut output = Vec::with_capacity(prompts.len());
+        let mut missing = Vec::new();
+        for (i, key) in keys.iter().enumerate() {
+            let vector = self.cached_vector(key)?;
+            if vector.is_some() {
+                stats.cache_hits += 1;
+            } else {
+                missing.push(i);
+            }
+            output.push(vector);
+        }
+        if !missing.is_empty() {
+            self.check_cancelled()?;
+            self.ensure_engine()?;
+            let texts: Vec<_> = missing.iter().map(|&i| prompts[i].as_str()).collect();
+            let vectors = self
+                .engine
+                .as_mut()
+                .context("embedding engine not initialized")?
+                .embed_many(&texts)?;
+            for (i, vector) in missing.into_iter().zip(vectors) {
+                self.cache.put(&keys[i], &vector)?;
+                output[i] = Some(vector);
+                stats.embedded += 1;
+            }
+        }
+        self.progress.update(stats);
+        output
+            .into_iter()
+            .map(|vector| vector.context("model returned too few embeddings"))
+            .collect()
+    }
+
+    pub(crate) fn embed_uncached(&mut self, text: &str, stats: &mut Stats) -> Result<Vec<f32>> {
+        self.ensure_engine()?;
         let vector = self
             .engine
             .as_mut()
             .context("embedding engine not initialized")?
             .embed(text)?;
-        self.cache.put(&key, &vector)?;
         stats.embedded += 1;
+        self.progress.update(stats);
         Ok(vector)
     }
 
@@ -151,6 +268,17 @@ impl<'a> Searcher<'a> {
 
     pub fn search(&mut self, query: &str) -> Result<Response> {
         self.validate_query(query)?;
+        if !self.args.exhaustive
+            && !self.args.count
+            && !self.args.files_with_matches
+            && !self.args.files_without_match
+            && !self.args.invert_match
+            && self.args.max_count.is_none()
+        {
+            return self.search_candidates(query);
+        }
+        self.progress
+            .begin("reading files and matching semantic chunks");
         let mut stats = Stats::default();
         let query_vector = self.query_vector(query, &mut stats)?;
         let mut hits = Vec::new();
@@ -181,9 +309,13 @@ impl<'a> Searcher<'a> {
                     &mut stats,
                 )?;
             } else if path.is_dir() {
-                for entry in WalkBuilder::new(&path)
-                    .follow_links(self.args.dereference_recursive)
-                    .build()
+                for entry in input::walker(
+                    &path,
+                    self.args.no_ignore,
+                    self.args.hidden,
+                    self.args.dereference_recursive,
+                )
+                .build()
                 {
                     let entry = entry?;
                     if entry.file_type().is_some_and(|kind| kind.is_file()) {
@@ -200,6 +332,7 @@ impl<'a> Searcher<'a> {
                 self.scan_file(&path, &query_vector, &mut hits, &mut counts, &mut stats)?;
             }
         }
+        self.progress.finish(&stats);
         Ok(Response {
             query: query.to_owned(),
             hits,
@@ -232,20 +365,25 @@ impl<'a> Searcher<'a> {
         counts: &mut BTreeMap<String, u64>,
         stats: &mut Stats,
     ) -> Result<()> {
+        self.note_file(stats);
+        self.read_file(path, |this, reader, label| {
+            this.scan(reader, label, query, hits, counts, stats)
+        })
+    }
+
+    pub(crate) fn note_file(&mut self, stats: &mut Stats) {
         stats.files += 1;
         if stats.files >= INDEX_HINT_FILES
             && !self.hint_emitted
             && !self.args.no_index_hint
             && !self.args.quiet
+            && !self.args.no_messages
         {
             eprintln!(
                 "geg: searched {INDEX_HINT_FILES} files; for repeated searches build an explicit index: geg index <root>, then geg query <query> --index <printed-path> (已扫描较多文件，建议显式建立索引加速后续搜索)"
             );
             self.hint_emitted = true;
         }
-        self.read_file(path, |this, reader, label| {
-            this.scan(reader, label, query, hits, counts, stats)
-        })
     }
 
     fn scan(
@@ -259,7 +397,7 @@ impl<'a> Searcher<'a> {
     ) -> Result<()> {
         counts.entry(path.to_owned()).or_default();
         input::chunks(reader, self.args.chunk_lines, |line, text| {
-            if text.trim().is_empty() || counts[path] >= self.args.max_count.unwrap_or(u64::MAX) {
+            if !input::searchable(text) || counts[path] >= self.args.max_count.unwrap_or(u64::MAX) {
                 return Ok(());
             }
             stats.chunks += 1;

@@ -1,4 +1,6 @@
 /target/
+/.pi/
+/.geg/
 *.gguf
 *.sqlite3
 *.sqlite3-wal
@@ -7,3 +9,5 @@
 *.db-wal
 *.db-shm
 .DS_Store
+__pycache__/
+*.pyc

@@ -1,10 +1,15 @@
 //! Offline semantic grep with a local EmbeddingGemma GGUF model.
 mod cache;
+mod cache_management;
+mod candidates;
 mod cli;
+mod config;
 mod embedding;
 mod index;
 mod input;
+mod progress;
 mod search;
+mod tui;
 
 use std::{
     io::{self, BufRead, Read, Write},
@@ -13,7 +18,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, ensure};
-use clap::Parser;
+use clap::{CommandFactory, FromArgMatches};
 use directories::ProjectDirs;
 
 use crate::{
@@ -29,7 +34,10 @@ fn cache_dir() -> Result<PathBuf> {
         .to_owned())
 }
 
-fn run(args: &mut Args) -> Result<u8> {
+fn run(args: &mut Args, matches: &clap::ArgMatches) -> Result<u8> {
+    if !matches!(args.command, Some(Command::Skill)) {
+        config::apply(args, matches)?;
+    }
     normalize_args(args)?;
     if matches!(args.command, Some(Command::Skill)) {
         io::stdout()
@@ -50,6 +58,30 @@ fn run(args: &mut Args) -> Result<u8> {
         .cache
         .clone()
         .unwrap_or_else(|| defaults.join("vectors.sqlite3"));
+    if let Some(Command::Cache { action }) = &args.command {
+        let stdout = io::stdout();
+        let mut out = io::BufWriter::new(stdout.lock());
+        cache_management::run(action, &defaults, &cache_path, args, &mut out)?;
+        out.flush()?;
+        return Ok(0);
+    }
+    if args.tui {
+        let selected = tui::run(args, model, cache_path)?;
+        if let Some(hit) = selected {
+            let counts = std::collections::BTreeMap::from([(hit.path.clone(), 1)]);
+            let response = search::Response {
+                query: String::new(),
+                hits: vec![hit],
+                counts,
+                stats: search::Stats::default(),
+            };
+            let mut out = io::BufWriter::new(io::stdout().lock());
+            print_response(&mut out, &response, args)?;
+            out.flush()?;
+            return Ok(0);
+        }
+        return Ok(1);
+    }
     let cache = Cache::open(if args.no_cache {
         None
     } else {
@@ -60,12 +92,14 @@ fn run(args: &mut Args) -> Result<u8> {
     let mut out = io::BufWriter::new(stdout.lock());
     if let Some(command) = &args.command {
         return match command {
-            Command::Skill => unreachable!("skill command handled before model setup"),
+            Command::Skill | Command::Cache { .. } => {
+                unreachable!("command handled before model setup")
+            }
             Command::Index { paths, output } => {
                 let path = if let Some(path) = output {
                     path.clone()
                 } else {
-                    index::default_path(&defaults, paths)?
+                    index::default_path()?
                 };
                 let stats = searcher.build_index(paths, &path)?;
                 serde_json::to_writer(
@@ -147,6 +181,26 @@ fn print_response(out: &mut impl Write, response: &search::Response, args: &Args
         }
         return Ok(());
     }
+    if !args.json && args.format == "md" {
+        if !response.hits.is_empty() {
+            writeln!(out, "| path | line | score | text |")?;
+            writeln!(out, "| --- | ---: | ---: | --- |")?;
+            for hit in &response.hits {
+                writeln!(
+                    out,
+                    "| {} | {} | {:.4} | {} |",
+                    markdown_cell(&hit.path),
+                    hit.line,
+                    hit.score,
+                    markdown_cell(hit.text.trim_end())
+                )?;
+                if args.line_buffered {
+                    out.flush()?;
+                }
+            }
+        }
+        return Ok(());
+    }
     for hit in &response.hits {
         if args.json {
             serde_json::to_writer(&mut *out, hit)?;
@@ -175,6 +229,30 @@ fn print_response(out: &mut impl Write, response: &search::Response, args: &Args
     Ok(())
 }
 
+fn markdown_cell(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '|' => escaped.push_str("&#124;"),
+            '`' => escaped.push_str("&#96;"),
+            '\\' => escaped.push_str("&#92;"),
+            '*' => escaped.push_str("&#42;"),
+            '_' => escaped.push_str("&#95;"),
+            '[' => escaped.push_str("&#91;"),
+            ']' => escaped.push_str("&#93;"),
+            '\n' => escaped.push_str("<br>"),
+            '\r' => {}
+            '\t' => escaped.push_str("    "),
+            c if c.is_control() => escaped.extend(c.escape_default()),
+            c => escaped.push(c),
+        }
+    }
+    escaped
+}
+
 fn safe_text(text: &str) -> String {
     let mut escaped = String::with_capacity(text.len());
     for c in text.chars() {
@@ -190,6 +268,20 @@ fn safe_text(text: &str) -> String {
 fn normalize_args(args: &mut Args) -> Result<()> {
     if args.command.is_some() {
         return Ok(());
+    }
+    if args.tui {
+        if args.paths.is_empty()
+            && args
+                .query
+                .as_ref()
+                .is_some_and(|query| std::path::Path::new(query).exists())
+            && let Some(path) = args.query.take()
+        {
+            args.paths.push(PathBuf::from(path));
+        }
+        if args.paths.is_empty() {
+            args.paths.push(PathBuf::from("."));
+        }
     }
     if args.interactive {
         ensure!(
@@ -223,8 +315,23 @@ fn normalize_args(args: &mut Args) -> Result<()> {
 }
 
 fn main() -> ExitCode {
-    let mut args = Args::parse();
-    match run(&mut args) {
+    let matches = Args::command().get_matches();
+    let mut args = match Args::from_arg_matches(&matches) {
+        Ok(args) => args,
+        Err(error) => error.exit(),
+    };
+    let result = run(&mut args, &matches);
+    if result.is_ok()
+        && !matches!(args.command, Some(Command::Skill))
+        && let Ok(root) = cache_dir()
+    {
+        let path = args
+            .cache
+            .clone()
+            .unwrap_or_else(|| root.join("vectors.sqlite3"));
+        cache_management::warn(&root, &path, &args);
+    }
+    match result {
         Ok(code) => ExitCode::from(code),
         Err(error)
             if error

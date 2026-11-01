@@ -2,31 +2,45 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
-#[derive(Debug, Subcommand)]
+#[derive(Debug, Clone, Subcommand)]
+pub enum CacheCommand {
+    /// Show global cache paths, size and vector count
+    Info,
+    /// Clear global vectors and reclaim SQLite space (keeps models and project indexes)
+    Clean,
+}
+
+#[derive(Debug, Clone, Subcommand)]
 pub enum Command {
+    /// Inspect or clean the global vector cache; no model required
+    Cache {
+        #[command(subcommand)]
+        action: CacheCommand,
+    },
     /// Print the bundled agent skill (no model required)
     Skill,
-    /// Build/update a persistent repository index (no .geg directory needed)
+    /// Build/update a persistent repository index (default: ./.geg/index.sqlite3)
     Index {
         #[arg(required = true)]
         paths: Vec<PathBuf>,
-        /// Index database path (defaults to the user cache directory)
+        /// Index database path (defaults to ./.geg/index.sqlite3)
         #[arg(short, long)]
         output: Option<PathBuf>,
     },
     /// Search an existing index without reading source files
     Query {
         query: String,
-        #[arg(long)]
+        #[arg(long, default_value = ".geg/index.sqlite3")]
         index: PathBuf,
     },
 }
 
 /// Geg Embeds Gemma — local semantic grep. No network requests, ever.
-#[derive(Debug, Parser)]
+#[derive(Debug, Clone, Parser)]
 #[command(
     version,
     about,
+    args_override_self = true,
     disable_help_flag = true,
     subcommand_negates_reqs = true,
     subcommand_precedence_over_arg = true,
@@ -35,6 +49,20 @@ pub enum Command {
 pub struct Args {
     #[command(subcommand)]
     pub command: Option<Command>,
+    /// Read a specific .gegrc.toml instead of discovered user/project configs
+    #[arg(long, global = true, conflicts_with = "no_config")]
+    pub config: Option<PathBuf>,
+    #[arg(skip)]
+    pub index_path: Option<PathBuf>,
+    /// Ignore user/project configuration files
+    #[arg(long, global = true)]
+    pub no_config: bool,
+    /// Disable ignore-file filtering during directory traversal
+    #[arg(long, global = true)]
+    pub no_ignore: bool,
+    /// Include hidden files/directories (the .geg index directory is always skipped)
+    #[arg(long, global = true)]
+    pub hidden: bool,
     #[arg(long, action = clap::ArgAction::Help)]
     help: Option<bool>,
     /// Suppress normal output (exit status still reports matches)
@@ -110,8 +138,8 @@ pub struct Args {
     /// Flush output after every selected line
     #[arg(long, global = true)]
     pub line_buffered: bool,
-    /// Semantic query (omit in --interactive mode)
-    #[arg(required_unless_present_any = ["interactive", "patterns", "pattern_files"])]
+    /// Semantic query (optional in --interactive/--tui mode)
+    #[arg(required_unless_present_any = ["interactive", "tui", "patterns", "pattern_files"])]
     pub query: Option<String>,
     /// Files/directories; '-' or no paths reads stdin
     pub paths: Vec<PathBuf>,
@@ -124,12 +152,33 @@ pub struct Args {
     /// Disable persistent vector caching
     #[arg(long, global = true)]
     pub no_cache: bool,
+    /// Warn on stderr above this global cache size in GiB; 0 disables the warning
+    #[arg(long, global = true, default_value_t = 10, value_parser = clap::value_parser!(u32).range(0..=1048576))]
+    pub cache_warning_gb: u32,
     /// Keep model/context resident; read one query per stdin line, emit JSON responses
     #[arg(long)]
     pub interactive: bool,
-    /// Emit one JSON object per match (interactive mode always emits JSON responses)
-    #[arg(long, global = true)]
+    /// fzf-style live fuzzy finder with debounced semantic reranking and Tab preview
+    #[arg(long, conflicts_with_all = ["interactive", "patterns", "pattern_files", "quiet", "count", "files_with_matches", "files_without_match"])]
+    pub tui: bool,
+    /// Emit one JSON object per match instead of Markdown (interactive mode always uses JSON)
+    #[arg(long = "jsonl", global = true)]
     pub json: bool,
+    /// Ranked result format (Markdown by default; grep for line-oriented output)
+    #[arg(long, global = true, default_value = "md", value_parser = ["md", "grep"])]
+    pub format: String,
+    /// Disable stderr progress/status without hiding results
+    #[arg(long, global = true)]
+    pub no_progress: bool,
+    /// Inference device: auto selects an available GPU, gpu requires one, cpu disables offload
+    #[arg(long, global = true, env = "GEG_DEVICE", default_value = "auto", value_parser = ["auto", "gpu", "cpu"])]
+    pub device: String,
+    /// Embed every chunk instead of fast lexical candidate selection (slower, broader recall)
+    #[arg(long, global = true)]
+    pub exhaustive: bool,
+    /// Maximum chunks semantically reranked in fast search (index/query always cover all chunks)
+    #[arg(long, global = true, default_value_t = 32, value_parser = clap::value_parser!(u32).range(1..=512))]
+    pub candidates: u32,
     /// Maximum number of ranked matches
     #[arg(short = 'k', long, global = true, default_value_t = 10, value_parser = clap::value_parser!(u32).range(1..=10000))]
     pub top: u32,

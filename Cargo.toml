@@ -1,6 +1,6 @@
 [package]
 name = "geg"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.88"
 description = "Geg Embeds Gemma: offline semantic grep with EmbeddingGemma 2 and persistent vector caching"
@@ -9,7 +9,7 @@ repository = "https://github.com/LIghtJUNction/geg"
 readme = "README.md"
 keywords = ["semantic-search", "grep", "embeddings", "gemma", "cli"]
 categories = ["command-line-utilities", "text-processing"]
-include = ["src/**", "tests/**", "Cargo.toml", "Cargo.lock", "README.md", "LICENSE", "skills/geg/SKILL.md", "scripts/benchmark.py"]
+include = ["src/**", "tests/**", "Cargo.toml", "Cargo.lock", "README.md", "LICENSE", "THIRD_PARTY_NOTICES.md", "skills/geg/SKILL.md", "scripts/*.py"]
 
 [dependencies]
 anyhow = "1"
@@ -17,11 +17,26 @@ blake3 = "1"
 clap = { version = "4", features = ["derive", "env"] }
 directories = "6"
 ignore = "0.4"
+crossterm = { version = "0.29", default-features = false, features = ["events", "windows", "bracketed-paste"] }
+nucleo = "0.5"
+unicode-width = "0.2"
+indicatif = { version = "0.18", default-features = false }
+toml = { version = "0.9", default-features = false, features = ["parse", "serde"] }
 llama-cpp-4 = { version = "=0.9.0", default-features = false }
 rusqlite = { version = "0.38", features = ["bundled"] }
 self_cell = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+[features]
+native = ["llama-cpp-4/native"]
+cuda = ["llama-cpp-4/cuda"]
+
+[target.'cfg(any(target_os = "linux", target_os = "windows"))'.dependencies]
+llama-cpp-4 = { version = "=0.9.0", default-features = false, features = ["vulkan"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+llama-cpp-4 = { version = "=0.9.0", default-features = false, features = ["metal"] }
 
 [dev-dependencies]
 tempfile = "3"

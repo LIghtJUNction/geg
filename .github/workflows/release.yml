@@ -48,7 +48,7 @@ jobs:
           targets: ${{ matrix.target }}
       - name: Linux build dependencies
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y cmake clang libclang-dev
+        run: sudo apt-get update && sudo apt-get install -y cmake clang libclang-dev libvulkan-dev glslc
       - name: macOS libclang
         if: runner.os == 'macOS'
         run: |
@@ -60,6 +60,15 @@ jobs:
         run: |
           if (-not (Test-Path 'C:\Program Files\LLVM\bin\libclang.dll')) { choco install llvm -y }
           'LIBCLANG_PATH=C:\Program Files\LLVM\bin' >> $env:GITHUB_ENV
+      - name: Windows Vulkan SDK
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install vulkan-sdk -y --no-progress
+          $sdk = Get-ChildItem C:\VulkanSDK -Directory | Sort-Object Name -Descending | Select-Object -First 1
+          if (-not $sdk -or -not (Test-Path "$($sdk.FullName)\Bin\glslc.exe")) { throw 'Vulkan SDK/glslc missing' }
+          "VULKAN_SDK=$($sdk.FullName)" >> $env:GITHUB_ENV
+          "$($sdk.FullName)\Bin" >> $env:GITHUB_PATH
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }}
       - name: Check executable starts
@@ -79,7 +88,9 @@ jobs:
           EXECUTABLE: ${{ matrix.executable }}
         run: |
           ARCHIVE="geg-$TAG-$TARGET.tar.gz"
-          tar -czf "$ARCHIVE" -C "target/$TARGET/release" "$EXECUTABLE"
+          mkdir -p release-package
+          cp "target/$TARGET/release/$EXECUTABLE" LICENSE THIRD_PARTY_NOTICES.md release-package/
+          tar -czf "$ARCHIVE" -C release-package .
           if command -v sha256sum >/dev/null; then
             sha256sum "$ARCHIVE" > "$ARCHIVE.sha256"
           else

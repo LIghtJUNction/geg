@@ -1,6 +1,6 @@
 use std::{fs, path::Path, time::Duration};
 
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
 
 pub(crate) const FORMAT: &str = "geg-embedding-v1-llama4-0.9-mean-512";
@@ -37,6 +37,25 @@ impl Cache {
         db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;
             PRAGMA cache_size=-2048; PRAGMA mmap_size=0;
             CREATE TABLE IF NOT EXISTS vectors_v1 (key BLOB PRIMARY KEY, vector BLOB NOT NULL) WITHOUT ROWID;")?;
+        Ok(Self(Some(db)))
+    }
+
+    /// Borrow project-owned vectors without copying them back into the global cache.
+    pub fn open_index(path: &Path) -> Result<Self> {
+        if !path.is_file() {
+            return Ok(Self(None));
+        }
+        let db = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        db.busy_timeout(Duration::from_secs(30))?;
+        let current: bool = db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='vectors_v1')",
+            [],
+            |r| r.get(0),
+        )?;
+        if !current {
+            return Ok(Self(None));
+        }
+        db.execute_batch("PRAGMA cache_size=-2048; PRAGMA mmap_size=0;")?;
         Ok(Self(Some(db)))
     }
 
@@ -77,6 +96,40 @@ impl Cache {
             "invalid cached vector values; remove the cache file"
         );
         Ok(Some(vector))
+    }
+
+    pub fn shares_path(&self, path: &Path) -> Result<bool> {
+        let Some(db) = &self.0 else {
+            return Ok(false);
+        };
+        let Some(current) = db.path() else {
+            return Ok(false);
+        };
+        // Resolve existing files so symlink aliases cannot make the index delete itself.
+        Ok(path.exists() && fs::canonicalize(current)? == fs::canonicalize(path)?)
+    }
+
+    /// Transfer ownership of document vectors only after the index commit succeeds.
+    pub fn remove_indexed(&self, index: &Path) -> Result<()> {
+        let Some(db) = &self.0 else {
+            return Ok(());
+        };
+        ensure!(
+            !self.shares_path(index)?,
+            "index and global cache must use different database paths"
+        );
+        db.execute(
+            "ATTACH DATABASE ?1 AS geg_index",
+            [index.to_str().context("index path is not UTF-8")?],
+        )?;
+        let result = db.execute(
+            "DELETE FROM main.vectors_v1 WHERE key IN (SELECT key FROM geg_index.vectors_v1)",
+            [],
+        );
+        let detached = db.execute("DETACH DATABASE geg_index", []);
+        result?;
+        detached?;
+        Ok(())
     }
 
     pub fn put(&self, key: &blake3::Hash, vector: &[f32]) -> Result<()> {

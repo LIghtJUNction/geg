@@ -34,6 +34,8 @@ geg query --code 'retry failed requests'
 
 **纯本地，无 API key，无推理服务器。** 使用 EmbeddingGemma 2 的 **270M 文本骨干**，不加载视觉或音频编码器。Linux / Windows 自动检测 Vulkan GPU，macOS 使用 Metal；没有可用 GPU 时使用 CPU。模型已备好后，运行时不发起网络请求。
 
+**真实仓库试用：**在 AstrBot 的 1,850 个文件中查找登录密码验证，首次空向量缓存搜索 2.58 秒，重复查询中位数 0.11 秒，首条结果指向实际验证代码。另一次冷启动耗时 38.00 秒；机器、驱动和缓存状态都会影响速度。见[完整测试条件和结果](#实测与复现)。
+
 > 本 README 描述 main 分支的 **0.1.1 开发版本**；已发布的 0.1.0 仍是 CPU 版本，不具备这里的新输出、GPU 和缓存管理功能。在新版正式发布前，请使用下方的 Git 源码安装命令。
 
 ## 为什么用 geg？
@@ -358,6 +360,19 @@ geg skill | Set-Content -Encoding utf8 "$HOME\.agents\skills\geg\SKILL.md"
 Rust 包装层使用 `llama-cpp-4 0.9`，原生引擎和 SQLite 链入可执行文件。GPU 推理采用有界多序列 batch（最多 8 序列/1024 tokens，每序列最多 512 tokens），互不混合注意力。mmap 不代表零 RAM；模型页、词表和计算图仍有占用，GPU 显存另计。模型和原生依赖遵循各自许可证；不能把 Linux 二进制直接搬到 macOS / Windows。
 
 ## 实测与复现
+
+### AstrBot 实测（2026-11-01）
+
+使用 AstrBot 提交 [`59e44a76`](https://github.com/AstrBotDevs/AstrBot/tree/59e44a76d88279d7b50f18b9a862c81bae71737a)，Linux x86_64、i9-12900HX、RTX 4060 Laptop GPU、Q4 模型及 256 维向量。未建完整索引，默认快速模式扫描 1,850 个文件中的 59,441 个有效块，对 32 个候选做语义重排；统计显示有 **1 个文件被跳过**，因此不代表覆盖整个仓库。
+
+| 查询 | 空向量缓存首次搜索 | 同一查询重复 3 次中位数 | 首条结果及人工核对 |
+| --- | ---: | ---: | --- |
+| `失败请求的重试逻辑` | 38.00 秒 | 0.12 秒 | [gsv_selfhosted_source.py:81](https://github.com/AstrBotDevs/AstrBot/blob/59e44a76d88279d7b50f18b9a862c81bae71737a/astrbot/core/provider/sources/gsv_selfhosted_source.py#L81)：失败后等待并重试，最终失败时抛出异常。 |
+| `authenticate user password` | 2.58 秒 | 0.11 秒 | [auth_service.py:305](https://github.com/AstrBotDevs/AstrBot/blob/59e44a76d88279d7b50f18b9a862c81bae71737a/astrbot/dashboard/services/auth_service.py#L305)：检查请求类型并调用密码验证函数。 |
+
+每个查询使用各自的空临时向量数据库，首次均嵌入 33 次，重复运行均命中 33 条缓存、不加载模型；计时包含进程启动、扫描和输出。操作系统文件页缓存和 GPU 驱动缓存没有清空，两个查询也不是相同负载的对照实验。38 秒的具体原因未确认；这些是单机样本，不是速度保证或召回率评估。搜索分数不是概率，结果仍需结合源码核对。
+
+### 历史测试
 
 测试仓库：**AstrBot**，扫描 1,850 个文件 / 59,441 个有效文本块。Linux x86_64、i9-12900HX、RTX 4060 Laptop GPU，推荐 Q4 GGUF、256 维、默认 32 候选，查询“失败请求的重试逻辑”：
 
